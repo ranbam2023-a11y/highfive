@@ -1,0 +1,7 @@
+# build artifacts
+build/
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
