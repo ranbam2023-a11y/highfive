@@ -45,8 +45,11 @@ PLIST
 # start it
 launchctl bootout "gui/$(id -u)" "$AGENT" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$AGENT" 2>/dev/null || launchctl load -w "$AGENT"
+# bootstrap can race with the copy above, so make sure it is actually running
+launchctl kickstart -k "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
 
 echo
 echo "==> Installed and running."
-echo "    No permissions needed — it launches Raycast via the raycast:// deeplink."
+echo "    No permissions needed unless the action is 'shortcut' (Accessibility)."
+echo "    Change what it does:  HighFive --action raycast|app|shortcut"
 echo "    Logs: ~/Library/Logs/$APP_NAME.log"

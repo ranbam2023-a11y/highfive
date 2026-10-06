@@ -1,18 +1,21 @@
 //
-//  HighFive — open Raycast with a five-finger tap (or pinch) on the trackpad.
+//  HighFive — do something with a five-finger trackpad tap (or pinch).
 //
-//  A tiny background agent (~70 KB). It reads raw trackpad contacts from Apple's
-//  private MultitouchSupport framework and, when it sees five fingers touch and
-//  lift quickly, opens Raycast's launcher via its URL scheme (`raycast://`).
+//  A tiny background agent (~80 KB). It reads raw trackpad contacts from Apple's
+//  private MultitouchSupport framework and, when it sees five fingers land and
+//  lift quickly, does one of three things:
 //
-//  Why a URL and not a keystroke? On macOS 26+ WindowServer drops synthetic
-//  modifier-bearing key events before they reach Carbon hotkey matchers, so
-//  CGEventPost cannot trigger Raycast from an ad-hoc-signed helper. The app's
-//  own deeplink has no such gate — and needs no Accessibility permission.
+//    raycast   open Raycast's launcher through its own raycast:// link
+//    app       launch or activate any app
+//    shortcut  press a keyboard shortcut (needs Accessibility)
 //
-//  No third-party app, no license, no menu bar item, ~0% CPU.
+//  Why a URL and not a keystroke for Raycast: on macOS 26+ WindowServer drops
+//  synthetic modifier-bearing key events before they reach Carbon hotkey
+//  matchers, so CGEventPost cannot trigger Raycast from an ad-hoc-signed helper.
+//  Raycast's own deeplink has no such gate — and needs no permission at all.
 //
-//  Configure:   HighFive --set-url "raycast://"
+//  Configure:   HighFive --action shortcut --shortcut "cmd+shift+4"
+//               HighFive --show
 //  Verbose log: touch ~/.highfive-debug, then restart the agent.
 //
 
@@ -30,9 +33,6 @@ typealias MTStartFn       = @convention(c) (MTDeviceRef, Int32) -> Int32
 
 let frameworkPath = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
 
-/// Default target: Raycast's launcher deeplink.
-let defaultURL = "raycast://"
-
 // MARK: - Logging
 
 let logURL    = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Logs/HighFive.log")
@@ -46,10 +46,10 @@ func log(_ s: String, verboseOnly: Bool = false) {
     let line = "\(Date()) \(s)\n"
     try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(),
                                              withIntermediateDirectories: true)
-    if let h = try? FileHandle(forWritingTo: logURL) {
-        h.seekToEndOfFile()
-        h.write(line.data(using: .utf8)!)
-        try? h.close()
+    if let handle = try? FileHandle(forWritingTo: logURL) {
+        handle.seekToEndOfFile()
+        handle.write(Data(line.utf8))
+        try? handle.close()
     } else {
         try? line.write(to: logURL, atomically: true, encoding: .utf8)
     }
@@ -57,21 +57,53 @@ func log(_ s: String, verboseOnly: Bool = false) {
 
 // MARK: - Config
 
-let configURL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/highfive/url")
+struct Config: Codable {
+    /// "raycast", "app" or "shortcut".
+    var action = "raycast"
 
-func configuredURL() -> String {
-    if let s = try? String(contentsOf: configURL, encoding: .utf8) {
-        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !t.isEmpty { return t }
-    }
-    return defaultURL
+    // raycast
+    var url = "raycast://"
+    var bundleID = "com.raycast.macos"
+    var app = "Raycast"
+    var launchIfNeeded = true
+
+    // app
+    var appName = "Safari"
+
+    // shortcut
+    var shortcut = "cmd+space"
+
+    // detection
+    var fingers = 5
+    var gesture = "both"            // "tap", "pinch" or "both"
+    var tapMaxDuration = 0.50       // seconds from peak contact to all-up
+    var tapMaxDrift = 0.06          // centroid movement, 0…1 of trackpad
+    var pinchMaxDuration = 0.90
+    var pinchShrink = 0.70          // spread must fall below this fraction of peak
+    var cooldown = 0.60
 }
 
-let targetURL = configuredURL()
+let configURL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/highfive/config.json")
 
-// MARK: - Launching
+func loadConfig() -> Config {
+    guard let data = try? Data(contentsOf: configURL),
+          let config = try? JSONDecoder().decode(Config.self, from: data) else { return Config() }
+    return config
+}
 
-let raycastBundleID = "com.raycast.macos"
+func saveConfig(_ config: Config) {
+    try? FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(),
+                                             withIntermediateDirectories: true)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    if let data = try? encoder.encode(config) {
+        try? data.write(to: configURL, options: .atomic)
+    }
+}
+
+var currentConfig = loadConfig()
+
+// MARK: - Actions
 
 func isRunning(_ bundleID: String) -> Bool {
     !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
@@ -82,47 +114,59 @@ func runOpen(_ arguments: [String]) -> Int32 {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
     task.arguments = arguments
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError  = pipe
+    task.standardOutput = Pipe()
+    task.standardError = Pipe()
     do {
         try task.run()
         task.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let out = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !out.isEmpty { log("open(\(arguments.joined(separator: " "))) out=\(out)") }
         return task.terminationStatus
     } catch {
-        log("failed to run open: \(error.localizedDescription)")
+        log("failed to run open \(arguments.joined(separator: " ")): \(error.localizedDescription)")
         return -1
     }
 }
 
-/// Opens the target through LaunchServices (the same path as `open raycast://`).
-/// Cold start matters: if Raycast isn't running, the deeplink is delivered before
-/// it can show its launcher, so launch it first and give it a moment.
-func openTarget() {
-    log("open \(targetURL)")
-    if !isRunning(raycastBundleID) {
-        log("raycast not running; launching first")
-        runOpen(["-a", "Raycast"])
-        Thread.sleep(forTimeInterval: 1.2)
+let actionQueue = DispatchQueue(label: "com.ranbam.highfive.action")
+
+/// Does whatever the config asks for.
+func perform(_ config: Config) {
+    switch config.action {
+    case "app":
+        let name = config.appName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { log("action=app but no app is set"); return }
+        log("open -a \(name)")
+        let status = runOpen(["-a", name])
+        if status != 0 { log("open -a \(name) exited \(status)") }
+
+    case "shortcut":
+        guard ShortcutPoster.hasPermission else {
+            log("action=shortcut but Accessibility permission is not granted")
+            return
+        }
+        guard let combo = ShortcutParser.parse(config.shortcut) else {
+            log("could not parse shortcut \"\(config.shortcut)\"")
+            return
+        }
+        ShortcutPoster.post(combo)
+
+    default:
+        // Raycast's launcher, through its own deeplink.
+        if config.launchIfNeeded, !config.bundleID.isEmpty, !isRunning(config.bundleID) {
+            log("\(config.bundleID) not running, launching \(config.app) first")
+            runOpen(["-a", config.app])
+            Thread.sleep(forTimeInterval: 1.2)
+        }
+        log("open \(config.url)")
+        let status = runOpen([config.url])
+        if status != 0 { log("open \(config.url) exited \(status)") }
     }
-    log("open exit=\(runOpen([targetURL]))")
 }
 
 // MARK: - Gesture detection
 
 final class Detector {
     private let lock = NSLock()
-
-    // Tunables
-    private let requiredFingers: Int   = 5
-    private let tapMaxDuration: Double = 0.50   // seconds from peak to fingers-up
-    private let tapMaxDrift: Float     = 0.06   // centroid movement (0..1)
-    private let pinchMaxDuration: Double = 0.90
-    private let pinchShrink: Float     = 0.70   // spread must fall below 70% of peak
-    private let cooldown: Double       = 0.60
+    private var config: Config
 
     // Gesture state
     private var maxCount = 0
@@ -133,103 +177,203 @@ final class Detector {
     private var minSpread: Float = .greatestFiniteMagnitude
     private var lastFire: Double = 0
 
+    init(config: Config) { self.config = config }
+
+    func update(_ newConfig: Config) {
+        lock.lock(); config = newConfig; lock.unlock()
+    }
+
     func handle(touches: UnsafeMutablePointer<MTTouch>?, count: Int, timestamp: Double) {
-        var pts: [(Float, Float)] = []
+        var points: [(Float, Float)] = []
         if let touches = touches {
             for i in 0..<count {
-                let t = touches[i]
-                if t.state == 3 || t.state == 4 {           // MakeTouch / Touching
-                    pts.append((t.normalizedVector.position.x, t.normalizedVector.position.y))
+                let touch = touches[i]
+                if touch.state == 3 || touch.state == 4 {      // MakeTouch / Touching
+                    points.append((touch.normalizedVector.position.x,
+                                   touch.normalizedVector.position.y))
                 }
             }
         }
 
         lock.lock(); defer { lock.unlock() }
+        let config = self.config
         let now = timestamp
-        let n = pts.count
+        let fingers = points.count
 
-        if n == 0 {
-            if maxCount > 0 {
-                let dur = now - baseTime
-                let isTap = maxCount >= requiredFingers && dur < tapMaxDuration && maxDrift < tapMaxDrift
-                let isPinch = maxCount >= requiredFingers && dur < pinchMaxDuration
-                    && baseSpread > 0 && minSpread < baseSpread * pinchShrink
-                if (isTap || isPinch) && (now - lastFire) > cooldown {
-                    lastFire = now
-                    log(String(format: "fire %@ fingers=%d dur=%.3f drift=%.3f spread=%.3f->%.3f",
-                               isTap ? "tap" : "pinch", maxCount, dur, maxDrift, baseSpread, minSpread))
-                    DispatchQueue.main.async { openTarget() }
-                } else {
-                    log(String(format: "skip fingers=%d dur=%.3f drift=%.3f", maxCount, dur, maxDrift),
-                        verboseOnly: true)
-                }
+        if fingers == 0 {
+            defer { clear() }
+            guard maxCount > 0 else { return }
+
+            let duration = now - baseTime
+            guard maxCount >= config.fingers, now - lastFire > config.cooldown else { return }
+
+            let allowsTap = config.gesture != "pinch"
+            let allowsPinch = config.gesture != "tap"
+
+            let isTap = allowsTap && duration < config.tapMaxDuration
+                && maxDrift < Float(config.tapMaxDrift)
+            let isPinch = allowsPinch && duration < config.pinchMaxDuration
+                && baseSpread > 0 && minSpread < baseSpread * Float(config.pinchShrink)
+
+            guard isTap || isPinch else {
+                log(String(format: "skip fingers=%d dur=%.3f drift=%.3f", maxCount, duration, maxDrift),
+                    verboseOnly: true)
+                return
             }
-            maxCount = 0; maxDrift = 0; baseSpread = 0
-            minSpread = .greatestFiniteMagnitude
+
+            lastFire = now
+            log(String(format: "fire %@ fingers=%d dur=%.3f action=%@",
+                       isTap ? "tap" : "pinch", maxCount, duration, config.action))
+            let snapshot = config
+            actionQueue.async { perform(snapshot) }
             return
         }
 
-        let cx = pts.reduce(0) { $0 + $1.0 } / Float(n)
-        let cy = pts.reduce(0) { $0 + $1.1 } / Float(n)
+        let cx = points.reduce(0) { $0 + $1.0 } / Float(fingers)
+        let cy = points.reduce(0) { $0 + $1.1 } / Float(fingers)
         var spread: Float = 0
-        for p in pts { spread += hypot(p.0 - cx, p.1 - cy) }
-        spread /= Float(n)
+        for point in points { spread += hypot(point.0 - cx, point.1 - cy) }
+        spread /= Float(fingers)
 
-        if n > maxCount {                       // re-baseline whenever we hit a new peak
-            maxCount = n
+        if fingers > maxCount {                 // re-baseline whenever we hit a new peak
+            maxCount = fingers
             baseTime = now
             baseCentroid = (cx, cy)
             baseSpread = spread
             maxDrift = 0
             minSpread = spread
         } else {
-            let d = hypot(cx - baseCentroid.x, cy - baseCentroid.y)
-            if d > maxDrift { maxDrift = d }
+            let drift = hypot(cx - baseCentroid.x, cy - baseCentroid.y)
+            if drift > maxDrift { maxDrift = drift }
             if spread < minSpread { minSpread = spread }
         }
     }
+
+    private func clear() {
+        maxCount = 0
+        maxDrift = 0
+        baseSpread = 0
+        minSpread = .greatestFiniteMagnitude
+    }
 }
 
-let detector = Detector()
+let detector = Detector(config: currentConfig)
 let frameCallback: MTFrameCallback = { _, touches, count, timestamp, _ in
     detector.handle(touches: touches, count: count, timestamp: timestamp)
 }
 
-// Debug: `kill -USR1 <pid>` opens the target once, to test the agent's own context.
+// Debug: `kill -USR1 <pid>` performs the action once, to test the agent's own
+// context. `kill -HUP <pid>` re-reads the config without restarting.
 signal(SIGUSR1, SIG_IGN)
 let sigSrc = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
-sigSrc.setEventHandler { openTarget() }
+sigSrc.setEventHandler { actionQueue.async { perform(currentConfig) } }
 sigSrc.resume()
 
-// MARK: - Entry point
+signal(SIGHUP, SIG_IGN)
+let hupSrc = DispatchSource.makeSignalSource(signal: SIGHUP, queue: .main)
+hupSrc.setEventHandler {
+    currentConfig = loadConfig()
+    detector.update(currentConfig)
+    log("reloaded config action=\(currentConfig.action)")
+}
+hupSrc.resume()
+
+// MARK: - Command line
 
 let args = CommandLine.arguments
 
-func argValue(after flag: String) -> String? {
-    guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
-    return args[i + 1]
+func value(after flag: String) -> String? {
+    guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return nil }
+    return args[index + 1]
 }
 
-if let raw = argValue(after: "--set-url") {
-    try? FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(),
-                                             withIntermediateDirectories: true)
-    try? (raw + "\n").write(to: configURL, atomically: true, encoding: .utf8)
-    print("HighFive will now open: \(raw)")
+func printConfig(_ config: Config) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    if let data = try? encoder.encode(config), let text = String(data: data, encoding: .utf8) {
+        print(text)
+    }
+}
+
+if args.contains("--help") || args.contains("-h") {
+    print("""
+    HighFive — a five-finger trackpad gesture that does one thing.
+
+      --show                       print the current settings
+      --action raycast|app|shortcut  what the gesture does (default raycast)
+      --url <url>                  raycast: link to open (default raycast://)
+      --app <name>                 app: which app to open
+      --bundle <id>                raycast: bundle id used for the cold-start check
+      --shortcut <combo>           shortcut: e.g. cmd+shift+4, option+f, ⌥F
+      --fingers <n>                how many fingertips are required (default 5)
+      --gesture tap|pinch|both     which gesture to accept (default both)
+      --fire                       do the action once, now
+      --test-shortcut <combo>      parse a shortcut and report it
+
+    After changing settings, restart the agent so it picks them up:
+      launchctl kickstart -k gui/$(id -u)/com.ranbam.highfive
+    """)
     exit(0)
 }
 
 if args.contains("--show") {
-    print("HighFive opens: \(targetURL)")
+    printConfig(currentConfig)
     exit(0)
 }
 
-if args.contains("--fire") {                      // self-test: open it once
-    openTarget()
+if let combo = value(after: "--test-shortcut") {
+    guard let parsed = ShortcutParser.parse(combo) else {
+        print("could not parse \"\(combo)\"")
+        exit(1)
+    }
+    print("parsed: \(parsed.display)  keyCode=\(parsed.keyCode)  flags=\(parsed.flags.rawValue)")
+    print("accessibility permission: \(ShortcutPoster.hasPermission)")
+    if args.contains("--post") { print("posted: \(ShortcutPoster.post(parsed))") }
+    exit(0)
+}
+
+if args.contains("--fire") {
+    perform(currentConfig)
     Thread.sleep(forTimeInterval: 1.0)
     exit(0)
 }
 
-log("start version=1.0 target=\"\(targetURL)\" verbose=\(verbose)")
+// Any setting flag rewrites the config file.
+var configChanged = false
+var config = currentConfig
+
+if let action = value(after: "--action") {
+    guard ["raycast", "app", "shortcut"].contains(action) else {
+        print("--action must be raycast, app or shortcut"); exit(2)
+    }
+    config.action = action; configChanged = true
+}
+if let url = value(after: "--url")           { config.url = url; configChanged = true }
+if let app = value(after: "--app")           { config.appName = app; configChanged = true }
+if let bundle = value(after: "--bundle")     { config.bundleID = bundle; configChanged = true }
+if let shortcut = value(after: "--shortcut") { config.shortcut = shortcut; configChanged = true }
+if let fingers = value(after: "--fingers") {
+    guard let n = Int(fingers), (1...10).contains(n) else { print("--fingers must be 1…10"); exit(2) }
+    config.fingers = n; configChanged = true
+}
+if let gesture = value(after: "--gesture") {
+    guard ["tap", "pinch", "both"].contains(gesture) else {
+        print("--gesture must be tap, pinch or both"); exit(2)
+    }
+    config.gesture = gesture; configChanged = true
+}
+
+if configChanged {
+    saveConfig(config)
+    currentConfig = config
+    print("Saved. Restart the agent to apply it:")
+    print("  launchctl kickstart -k gui/$(id -u)/com.ranbam.highfive")
+    exit(0)
+}
+
+// MARK: - Run the agent
+
+log("start version=1.1 action=\(currentConfig.action) fingers=\(currentConfig.fingers) gesture=\(currentConfig.gesture) verbose=\(verbose)")
 
 guard let handle = dlopen(frameworkPath, RTLD_NOW) else {
     log("fatal: dlopen failed: \(String(cString: dlerror()))")

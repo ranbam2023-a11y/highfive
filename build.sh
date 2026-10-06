@@ -10,7 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="HighFive"
-VERSION="1.0"
+VERSION="1.1"
 BUILD="$ROOT/build"
 DIST="$ROOT/dist"
 APP="$BUILD/$APP_NAME.app"
@@ -24,9 +24,9 @@ echo "==> Building $APP_NAME $VERSION"
 mkdir -p "$BUILD"
 
 # ---- icon -----------------------------------------------------------------
-if [ ! -f "$ICNS" ] || [ "$ROOT/src/make-icon.swift" -nt "$ICNS" ] || [ ! -f "$ROOT/assets/icon_1024.png" ]; then
+if [ ! -f "$ICNS" ] || [ "$ROOT/tools/make-icon.swift" -nt "$ICNS" ] || [ ! -f "$ROOT/assets/icon_1024.png" ]; then
   echo "--> generating icon"
-  swiftc -O "$ROOT/src/make-icon.swift" -o "$BUILD/make-icon"
+  swiftc -O "$ROOT/tools/make-icon.swift" -o "$BUILD/make-icon"
   "$BUILD/make-icon" "$ROOT/assets/icon_1024.png"
 
   rm -rf "$ICONSET"; mkdir -p "$ICONSET"
@@ -42,7 +42,8 @@ fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 echo "--> compiling"
-swiftc -O -import-objc-header "$ROOT/src/mt.h" "$ROOT/src/main.swift" \
+swiftc -O -swift-version 5 -import-objc-header "$ROOT/src/mt.h" \
+       "$ROOT"/src/*.swift \
        -o "$APP/Contents/MacOS/$APP_NAME"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 cp "$ICNS" "$APP/Contents/Resources/AppIcon.icns"
